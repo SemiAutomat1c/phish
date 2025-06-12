@@ -44,14 +44,35 @@ async def initialize_prisma():
     # Attempt to import and initialize Prisma
     try:
         from prisma import Prisma
-        db = Prisma()
-        prisma_initialized = True
-        print("Prisma client initialized successfully")
+        
+        # Check if DATABASE_URL is set
+        db_url = os.environ.get('DATABASE_URL')
+        if not db_url:
+            print("WARNING: DATABASE_URL environment variable is not set!")
+            # Use a default SQLite URL for testing
+            os.environ['DATABASE_URL'] = "file:./dev.db"
+            print("Using SQLite database as fallback")
+        
+        # Force generate client if needed
+        try:
+            db = Prisma()
+            prisma_initialized = True
+            print("Prisma client initialized successfully")
+        except Exception as e:
+            if "Client hasn't been generated yet" in str(e):
+                print("Prisma client not generated, generating now...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "prisma==0.11.0", "--upgrade"])
+                subprocess.check_call([sys.executable, "-m", "prisma", "generate", "--schema=./prisma/schema.prisma"])
+                db = Prisma()
+                prisma_initialized = True
+                print("Prisma client generated and initialized successfully.")
+            else:
+                raise
     except ImportError:
         print("Prisma client not found, attempting to generate...")
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "prisma==0.11.0", "--upgrade"])
-            subprocess.check_call([sys.executable, "-m", "prisma", "generate"])
+            subprocess.check_call([sys.executable, "-m", "prisma", "generate", "--schema=./prisma/schema.prisma"])
             from prisma import Prisma
             db = Prisma()
             prisma_initialized = True

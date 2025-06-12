@@ -20,12 +20,5 @@
       "src": "/(.*)",
       "dest": "app.py"
     }
-  ],
-  "env": {
-    "PYTHONPATH": "$PYTHONPATH:.",
-    "DATABASE_URL": "${DATABASE_URL}",
-    "SECRET_KEY": "${SECRET_KEY}",
-    "ADMIN_USERNAME": "${ADMIN_USERNAME}",
-    "ADMIN_PASSWORD": "${ADMIN_PASSWORD}"
-  }
+  ]
 }
